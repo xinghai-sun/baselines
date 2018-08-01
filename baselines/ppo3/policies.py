@@ -18,16 +18,16 @@ def nature_cnn(unscaled_images, **conv_kwargs):
   return activ(fc(h3, 'fc1', nh=512, init_scale=np.sqrt(2)))
 
 class LnLstmPolicy(object):
-  def __init__(self, sess, ob_space, ac_space, nbatch, nsteps, nlstm=256, reuse=False):
-    nenv = nbatch // nsteps
+  def __init__(self, sess, ob_space, ac_space, nbatch, unroll_length, nlstm=256, reuse=False):
+    nenv = nbatch // unroll_length
     X, processed_x = observation_input(ob_space, nbatch)
     M = tf.placeholder(tf.float32, [nbatch]) #mask (done t-1)
     S = tf.placeholder(tf.float32, [nenv, nlstm*2]) #states
     self.pdtype = make_pdtype(ac_space)
     with tf.variable_scope("model", reuse=reuse):
       h = nature_cnn(processed_x)
-      xs = batch_to_seq(h, nenv, nsteps)
-      ms = batch_to_seq(M, nenv, nsteps)
+      xs = batch_to_seq(h, nenv, unroll_length)
+      ms = batch_to_seq(M, nenv, unroll_length)
       h5, snew = lnlstm(xs, ms, S, 'lstm1', nh=nlstm)
       h5 = seq_to_batch(h5)
       vf = fc(h5, 'v', 1)
@@ -53,8 +53,8 @@ class LnLstmPolicy(object):
 
 class LstmPolicy(object):
 
-  def __init__(self, sess, ob_space, ac_space, nbatch, nsteps, nlstm=256, reuse=False):
-    nenv = nbatch // nsteps
+  def __init__(self, sess, ob_space, ac_space, nbatch, unroll_length, nlstm=256, reuse=False):
+    nenv = nbatch // unroll_length
     self.pdtype = make_pdtype(ac_space)
     X, processed_x = observation_input(ob_space, nbatch)
 
@@ -62,8 +62,8 @@ class LstmPolicy(object):
     S = tf.placeholder(tf.float32, [nenv, nlstm*2]) #states
     with tf.variable_scope("model", reuse=reuse):
       h = nature_cnn(X)
-      xs = batch_to_seq(h, nenv, nsteps)
-      ms = batch_to_seq(M, nenv, nsteps)
+      xs = batch_to_seq(h, nenv, unroll_length)
+      ms = batch_to_seq(M, nenv, unroll_length)
       h5, snew = lstm(xs, ms, S, 'lstm1', nh=nlstm)
       h5 = seq_to_batch(h5)
       vf = fc(h5, 'v', 1)
@@ -89,7 +89,7 @@ class LstmPolicy(object):
 
 class CnnPolicy(object):
 
-  def __init__(self, sess, ob_space, ac_space, nbatch, nsteps, reuse=False, **conv_kwargs): #pylint: disable=W0613
+  def __init__(self, sess, ob_space, ac_space, nbatch, unroll_length, reuse=False, **conv_kwargs): #pylint: disable=W0613
     self.pdtype = make_pdtype(ac_space)
     X, processed_x = observation_input(ob_space, nbatch)
     with tf.variable_scope("model", reuse=reuse):
@@ -114,7 +114,7 @@ class CnnPolicy(object):
     self.value = value
 
 class MlpPolicy(object):
-  def __init__(self, sess, ob_space, ac_space, nbatch, nsteps, reuse=False): #pylint: disable=W0613
+  def __init__(self, sess, ob_space, ac_space, nbatch, unroll_length, reuse=False): #pylint: disable=W0613
     self.pdtype = make_pdtype(ac_space)
     with tf.variable_scope("model", reuse=reuse):
       X, processed_x = observation_input(ob_space, nbatch)
