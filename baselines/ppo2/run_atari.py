@@ -24,10 +24,8 @@ def train(env_id, num_timesteps, seed, policy):
     ppo2.learn(policy=policy, env=env, nsteps=128, nminibatches=4,
         lam=0.95, gamma=0.99, noptepochs=4, log_interval=1,
         ent_coef=.01,
-        #lr=lambda f : f * 2.5e-4,
-        lr=2.5e-4,
-        #cliprange=lambda f : f * 0.1,
-        cliprange=0.1,
+        lr=lambda f : f * 2.5e-4,
+        cliprange=lambda f : f * 0.1,
         total_timesteps=int(num_timesteps * 1.1))
 
 def main():

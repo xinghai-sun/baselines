@@ -126,7 +126,6 @@ class PPOActor(object):
     self._obs[:] = env.reset()
     self._state = self._model.initial_state
     self._done = False
-    self._cum_rewards = 0
 
     self._zmq_context = zmq.Context()
     self._model_requestor = self._zmq_context.socket(zmq.REQ)
@@ -156,11 +155,10 @@ class PPOActor(object):
       mb_neglogpacs.append(neglogpac[0])
       mb_dones.append(self._done)
       self._obs[:], reward, self._done, info = self._env.step(action)
-      self._cum_rewards += reward
       if self._done:
         self._obs[:] = self._env.reset()
-        episode_infos.append({'reward' : self._cum_rewards})
-        self._cum_rewards = 0
+        self._state = self._model.initial_state
+      if 'episode' in info: episode_infos.append(info.get('episode'))
       mb_rewards.append(reward)
     mb_obs = np.asarray(mb_obs, dtype=self._obs.dtype)
     mb_rewards = np.asarray(mb_rewards, dtype=np.float32)
@@ -206,8 +204,8 @@ class PPOLearner(object):
 
   def __init__(self, env, policy, unroll_length, lr, clip_range, batch_size,
                ent_coef=0.01, vf_coef=0.5, max_grad_norm=0.5, queue_size=8,
-               print_interval=100, save_interval=10000, save_dir=None,
-               load_path=None):
+               print_interval=100, save_interval=10000, learn_act_speed_ratio=0,
+               save_dir=None, load_path=None):
     if isinstance(lr, float): lr = constfn(lr)
     else: assert callable(lr)
     if isinstance(clip_range, float): clip_range = constfn(clip_range)
@@ -218,6 +216,7 @@ class PPOLearner(object):
     self._unroll_length = unroll_length
     self._print_interval = print_interval
     self._save_interval = save_interval
+    self._learn_act_speed_ratio = learn_act_speed_ratio
     self._save_dir = save_dir
 
     self._model = Model(policy=policy,
@@ -234,6 +233,7 @@ class PPOLearner(object):
     self._data_queue = deque(maxlen=queue_size)
     self._episode_infos = deque(maxlen=200)
     self._rollout_fps = -1
+    self._num_unrolls = 0
 
     self._zmq_context = zmq.Context()
     self._pull_data_thread = Thread(
@@ -246,10 +246,14 @@ class PPOLearner(object):
     self._reply_model_thread.start()
 
   def run(self):
-    while len(self._data_queue) < self._batch_size: time.sleep(1)
+    while len(self._data_queue) < self._data_queue.maxlen: time.sleep(1)
     update, loss = 0, []
     time_start = time.time()
     while True:
+      while (self._learn_act_speed_ratio > 0 and
+          update * self._batch_size >= \
+          self._num_unrolls * self.learn_act_speed_ratio):
+        time.sleep(0.001)
       update += 1
       lr_now = self._lr(update)
       clip_range_now = self._clip_range(update)
@@ -269,7 +273,7 @@ class PPOLearner(object):
         train_fps = self._print_interval * batch_steps / time_elapsed
         rollout_fps = self._print_interval * batch_steps / time_elapsed
         var = explained_variance(values, returns)
-        avg_reward = safemean([info['reward'] for info in self._episode_infos])
+        avg_reward = safemean([info['r'] for info in self._episode_infos])
         print("Update: %d	Train-fps: %.1f	Rollout-fps: %.1f	"
               "Explained-var: %.5f	Avg-reward %.2f	Policy-loss: %.5f	"
               "Value-loss: %.5f	Policy-entropy: %.5f	Time-elapsed: %.1f" % (
@@ -288,16 +292,16 @@ class PPOLearner(object):
     receiver.setsockopt(zmq.RCVHWM, 1)
     receiver.setsockopt(zmq.SNDHWM, 1)
     receiver.bind("tcp://*:5700")
-    start_time, num_frames, num_pulls = time.time(), 0, 0
+    start_time, num_frames_now = time.time(), 0
     while True:
       data = receiver.recv_pyobj()
       data_queue.append(data[:-1])
       episode_infos.extend(data[-1])
-      num_frames += data[0].shape[0]
-      num_pulls += 1
-      if num_pulls % 100 == 0:
-        self._rollout_fps = num_frames / (time.time() - start_time)
-        start_time, num_frames = time.time(), 0
+      self._num_unrolls += 1
+      num_frames_now += data[0].shape[0]
+      if self._num_unrolls % 100 == 0:
+        self._rollout_fps = num_frames_now / (time.time() - start_time)
+        start_time, num_frames_now = time.time(), 0
 
   def _reply_model(self, zmq_context, model):
     receiver = zmq_context.socket(zmq.REP)
