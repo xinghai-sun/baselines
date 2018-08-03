@@ -1,6 +1,21 @@
-# PPO3
+# PPO3 (Distributed PPO with ZeroMQ)
 
+## Introduction
+
+- A distributed version of PPO with pyzmq.
 - Original paper: https://arxiv.org/abs/1707.06347
-- Baselines blog post: https://blog.openai.com/openai-baselines-ppo/
-- `python -m baselines.ppo3.run_atari` runs the algorithm for 40M frames = 10M timesteps on an Atari game. See help (`-h`) for more options.
-- `python -m baselines.ppo3.run_mujoco` runs the algorithm for 1M frames on a Mujoco environment.
+
+## Example: Run Atari
+
+### Actor(s)
+```sh
+for i in $(seq 0 7); do
+  python3 -m baselines.ppo3.run_atari --job_name actor &
+done;
+wait
+```
+
+### Learner
+```sh
+python -m baselines.ppo3.run_atari --job_name learner
+```
