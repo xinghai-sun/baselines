@@ -14,6 +14,7 @@ from baselines.common.misc_util import (
   boolean_flag,
 )
 import baselines.ddpg2.training as training
+from baselines.ddpg2.training import DDPGActor, DDPGLearner
 from baselines.ddpg2.models import Actor, Critic
 from baselines.ddpg2.memory import Memory
 from baselines.ddpg2.noise import *
@@ -34,37 +35,35 @@ class SymmetricActionWrapper(gym.ActionWrapper):
     return action + self._offset
 
 
-def create_env():
+class NumpyObservationWrapper(gym.ObservationWrapper):
+
+  def observation(self, obs):
+    return np.array(obs, dtype=np.float32)
+
+
+def create_env(seed):
   env = ProstheticsEnv(visualize=False)
-  env.change_model(model='3D', prosthetic=True, difficulty=0, seed=None)
+  env.change_model(model='3D', prosthetic=True, difficulty=0, seed=seed)
   env = SymmetricActionWrapper(env)
+  env = NumpyObservationWrapper(env)
   return env
 
 
-def run(env_id, seed, noise_type, layer_norm, evaluation, **kwargs):
-  # Configure things.
-  rank = MPI.COMM_WORLD.Get_rank()
-  if rank != 0:
-    logger.set_level(logger.DISABLED)
+def run_actor_worker(args):
+  seed = int(time.time() * 1000) % 2^32
+  logger.info('seed={}, logdir={}'.format(seed, logger.get_dir()))
+  tf.reset_default_graph()
+  set_global_seeds(seed)
 
   # Create envs.
-  env = create_env()
-  env = bench.Monitor(
-      env, logger.get_dir() and os.path.join(logger.get_dir(), str(rank)))
-
-  if evaluation and rank==0:
-    eval_env = create_env()
-    eval_env = bench.Monitor(
-        eval_env, os.path.join(logger.get_dir(), 'gym_eval'))
-    env = bench.Monitor(env, None)
-  else:
-    eval_env = None
+  env = create_env(seed)
+  env = bench.Monitor(env, logger.get_dir())
 
   # Parse noise_type
   action_noise = None
   param_noise = None
-  nb_actions = env.action_space.shape[-1]
-  for current_noise_type in noise_type.split(','):
+  num_actions = env.action_space.shape[-1]
+  for current_noise_type in args.noise_type.split(','):
     current_noise_type = current_noise_type.strip()
     if current_noise_type == 'none':
       pass
@@ -75,90 +74,141 @@ def run(env_id, seed, noise_type, layer_norm, evaluation, **kwargs):
     elif 'normal' in current_noise_type:
       _, stddev = current_noise_type.split('_')
       action_noise = NormalActionNoise(
-          mu=np.zeros(nb_actions), sigma=float(stddev) * np.ones(nb_actions))
+          mu=np.zeros(num_actions), sigma=float(stddev) * np.ones(num_actions))
     elif 'ou' in current_noise_type:
       _, stddev = current_noise_type.split('_')
       action_noise = OrnsteinUhlenbeckActionNoise(
-          mu=np.zeros(nb_actions), sigma=float(stddev) * np.ones(nb_actions))
+          mu=np.zeros(num_actions), sigma=float(stddev) * np.ones(num_actions))
     else:
       raise RuntimeError('unknown noise type "{}"'.format(current_noise_type))
 
   # Configure components.
-  memory = Memory(limit=int(1e6),
-                  action_shape=env.action_space.shape,
-                  observation_shape=env.observation_space.shape)
-  critic = Critic(layer_norm=layer_norm)
-  actor = Actor(nb_actions, layer_norm=layer_norm)
+  critic_model = Critic(layer_norm=args.layer_norm)
+  actor_model = Actor(num_actions, layer_norm=args.layer_norm)
 
-  # Seed everything to make things reproducible.
-  seed = seed + 1000000 * rank
-  logger.info(
-      'rank {}: seed={}, logdir={}'.format(rank, seed, logger.get_dir()))
+  worker = DDPGActor(env=env,
+                     actor=actor_model,
+                     critic=critic_model,
+                     batch_size=args.batch_size,
+                     memory_size=args.client_memory_size,
+                     memory_warmup_size=args.client_memory_warmup_size,
+                     gamma=args.gamma,
+                     tau=args.tau,
+                     normalize_returns=args.normalize_returns,
+                     normalize_observations=args.normalize_observations,
+                     action_noise=action_noise,
+                     param_noise=param_noise,
+                     critic_l2_reg=args.critic_l2_reg,
+                     actor_lr=args.actor_lr,
+                     critic_lr=args.critic_lr,
+                     popart=args.popart,
+                     clip_norm=args.clip_norm,
+                     reward_scale=args.reward_scale,
+                     send_freq=args.actor_send_freq,
+                     learner_ip=args.learner_ip,
+                     ports=args.ports.split(','))
+  worker.run()
+  env.close()
+
+
+def run_learner_worker(args):
+  seed = int(time.time() * 1000) % 2^32
+  logger.info('seed={}, logdir={}'.format(seed, logger.get_dir()))
   tf.reset_default_graph()
   set_global_seeds(seed)
-  env.seed(seed)
-  if eval_env is not None:
-    eval_env.seed(seed)
 
-  # Disable logging for rank != 0 to avoid noise.
-  if rank == 0:
-    start_time = time.time()
-  training.train(env=env,
-                 eval_env=eval_env,
-                 param_noise=param_noise,
-                 action_noise=action_noise,
-                 actor=actor,
-                 critic=critic,
-                 memory=memory,
-                 **kwargs)
+  # Create envs.
+  env = create_env(seed)
+  env = bench.Monitor(env, logger.get_dir())
+
+  # Parse noise_type
+  action_noise = None
+  param_noise = None
+  num_actions = env.action_space.shape[-1]
+  for current_noise_type in args.noise_type.split(','):
+    current_noise_type = current_noise_type.strip()
+    if current_noise_type == 'none':
+      pass
+    elif 'adaptive-param' in current_noise_type:
+      _, stddev = current_noise_type.split('_')
+      param_noise = AdaptiveParamNoiseSpec(
+          initial_stddev=float(stddev), desired_action_stddev=float(stddev))
+    elif 'normal' in current_noise_type:
+      _, stddev = current_noise_type.split('_')
+      action_noise = NormalActionNoise(
+          mu=np.zeros(num_actions), sigma=float(stddev) * np.ones(num_actions))
+    elif 'ou' in current_noise_type:
+      _, stddev = current_noise_type.split('_')
+      action_noise = OrnsteinUhlenbeckActionNoise(
+          mu=np.zeros(num_actions), sigma=float(stddev) * np.ones(num_actions))
+    else:
+      raise RuntimeError('unknown noise type "{}"'.format(current_noise_type))
+
+  # Configure components.
+  critic_model = Critic(layer_norm=args.layer_norm)
+  actor_model = Actor(num_actions, layer_norm=args.layer_norm)
+
+  worker = DDPGLearner(env=env,
+                       actor=actor_model,
+                       critic=critic_model,
+                       batch_size=args.batch_size,
+                       memory_size=args.server_memory_size,
+                       memory_warmup_size=args.server_memory_warmup_size,
+                       gamma=args.gamma,
+                       tau=args.tau,
+                       normalize_returns=args.normalize_returns,
+                       normalize_observations=args.normalize_observations,
+                       action_noise=action_noise,
+                       param_noise=param_noise,
+                       critic_l2_reg=args.critic_l2_reg,
+                       actor_lr=args.actor_lr,
+                       critic_lr=args.critic_lr,
+                       popart=args.popart,
+                       clip_norm=args.clip_norm,
+                       reward_scale=args.reward_scale,
+                       print_interval=args.print_interval,
+                       ports=args.ports.split(','))
+  worker.run()
   env.close()
-  if eval_env is not None:
-    eval_env.close()
-  if rank == 0:
-    logger.info('total runtime: {}s'.format(time.time() - start_time))
-
 
 def parse_args():
   parser = argparse.ArgumentParser(
       formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
   parser.add_argument('--env-id', type=str, default='HalfCheetah-v1')
+  parser.add_argument('--job-name', type=str, default='actor')
+  parser.add_argument('--learner-ip', type=str, default='localhost')
+  parser.add_argument('--ports', type=str, default='6700,6701,6702')
   boolean_flag(parser, 'render-eval', default=False)
   boolean_flag(parser, 'layer-norm', default=True)
   boolean_flag(parser, 'render', default=False)
   boolean_flag(parser, 'normalize-returns', default=False)
   boolean_flag(parser, 'normalize-observations', default=True)
-  parser.add_argument('--seed', help='RNG seed', type=int, default=0)
   parser.add_argument('--critic-l2-reg', type=float, default=1e-2)
   parser.add_argument('--batch-size', type=int, default=64)
+  parser.add_argument('--client-memory-size', type=int, default=50000)
+  parser.add_argument('--client-memory-warmup-size', type=int, default=100)
+  parser.add_argument('--server-memory-size', type=int, default=1000000)
+  parser.add_argument('--server-memory-warmup-size', type=int, default=100)
+  parser.add_argument('--actor-send-freq', type=float, default=4.0)
   parser.add_argument('--actor-lr', type=float, default=1e-4)
   parser.add_argument('--critic-lr', type=float, default=1e-3)
   boolean_flag(parser, 'popart', default=False)
   parser.add_argument('--gamma', type=float, default=0.99)
+  parser.add_argument('--tau', type=float, default=0.01)
   parser.add_argument('--reward-scale', type=float, default=1.)
   parser.add_argument('--clip-norm', type=float, default=None)
-  parser.add_argument('--nb-epochs', type=int, default=500)
-  parser.add_argument('--nb-epoch-cycles', type=int, default=20)
-  parser.add_argument('--nb-train-steps', type=int, default=50)
-  parser.add_argument('--nb-eval-steps', type=int, default=100)
-  parser.add_argument('--nb-rollout-steps', type=int, default=100)
   parser.add_argument('--noise-type', type=str, default='adaptive-param_0.2')
-  parser.add_argument('--num-timesteps', type=int, default=None)
+  parser.add_argument('--print_interval', type=int, default=10)
   boolean_flag(parser, 'evaluation', default=False)
   args = parser.parse_args()
-  # we don't directly specify timesteps for this script, so make sure that if
-  # we do specify them they agree with the other parameters
-  if args.num_timesteps is not None:
-    assert(args.num_timesteps == \
-        args.nb_epochs * args.nb_epoch_cycles * args.nb_rollout_steps)
-  dict_args = vars(args)
-  del dict_args['num_timesteps']
-  return dict_args
+  return args
 
 
 if __name__ == '__main__':
   args = parse_args()
-  if MPI.COMM_WORLD.Get_rank() == 0:
-    logger.configure()
-  # Run actual script.
-  run(**args)
+  logger.configure()
+  if args.job_name == "actor":
+    run_actor_worker(args)
+  elif args.job_name == "learner":
+    run_learner_worker(args)

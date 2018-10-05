@@ -2,6 +2,8 @@ import os
 import time
 from collections import deque
 import pickle
+import queue
+from threading import Thread
 
 from baselines.ddpg2.ddpg import DDPG
 import baselines.common.tf_util as U
@@ -10,201 +12,210 @@ from baselines import logger
 import numpy as np
 import tensorflow as tf
 from mpi4py import MPI
+import zmq
+
+from baselines.ddpg2.replay_memory import RemoteReplayMemory
+from baselines.ddpg2.replay_memory import Transition
 
 
-def train(env, nb_epochs, nb_epoch_cycles, render_eval, reward_scale, render,
-          param_noise, actor, critic, normalize_returns, normalize_observations,
-          critic_l2_reg, actor_lr, critic_lr, action_noise, popart, gamma,
-          clip_norm, nb_train_steps, nb_rollout_steps, nb_eval_steps,
-          batch_size, memory, tau=0.01, eval_env=None,
-          param_noise_adaption_interval=50):
-  rank = MPI.COMM_WORLD.Get_rank()
+class DDPGActor(object):
 
-  # we assume symmetric actions.
-  assert (np.abs(env.action_space.low) == env.action_space.high).all()
-  max_action = env.action_space.high
-  logger.info(
-      'scaling actions by {} before executing in env'.format(max_action))
-  agent = DDPG(actor, critic, memory, env.observation_space.shape,
-               env.action_space.shape, gamma=gamma, tau=tau,
-               normalize_returns=normalize_returns,
-               normalize_observations=normalize_observations,
-               batch_size=batch_size, action_noise=action_noise,
-               param_noise=param_noise, critic_l2_reg=critic_l2_reg,
-               actor_lr=actor_lr, critic_lr=critic_lr, enable_popart=popart,
-               clip_norm=clip_norm, reward_scale=reward_scale)
-  logger.info('Using agent with the following configuration:')
-  logger.info(str(agent.__dict__.items()))
+  def __init__(self, env, actor, critic, batch_size, memory_size,
+               memory_warmup_size, gamma, tau, normalize_returns,
+               normalize_observations, action_noise, param_noise, critic_l2_reg,
+               actor_lr, critic_lr, popart, clip_norm, reward_scale,
+               send_freq=4.0, ports=("6700", "6701", "6702"),
+               learner_ip="localhost"):
+    assert (np.abs(env.action_space.low) == env.action_space.high).all()
+    self._env = env
+    self._batch_size = batch_size
+    self._max_action = env.action_space.high
+    logger.info(
+        'scaling actions by {} for executing in env'.format(self._max_action))
+    self._agent = DDPG(actor,
+                       critic,
+                       env.observation_space.shape,
+                       env.action_space.shape,
+                       gamma=gamma,
+                       tau=tau,
+                       normalize_returns=normalize_returns,
+                       normalize_observations=normalize_observations,
+                       action_noise=action_noise,
+                       param_noise=param_noise,
+                       critic_l2_reg=critic_l2_reg,
+                       actor_lr=actor_lr,
+                       critic_lr=critic_lr,
+                       enable_popart=popart,
+                       clip_norm=clip_norm,
+                       reward_scale=reward_scale)
 
-  # Set up logging stuff only for a single worker.
-  if rank == 0:
-    saver = tf.train.Saver()
-  else:
-    saver = None
+    self._replay_memory = RemoteReplayMemory(
+        is_server=False,
+        memory_size=memory_size,
+        memory_warmup_size=memory_warmup_size,
+        send_freq=send_freq,
+        ports=ports[:2],
+        server_ip=learner_ip)
 
-  step = 0
-  episode = 0
-  eval_episode_rewards_history = deque(maxlen=100)
-  episode_rewards_history = deque(maxlen=100)
-  with U.single_threaded_session() as sess:
-    # Prepare everything.
-    agent.initialize(sess)
-    sess.graph.finalize()
+    self._zmq_context = zmq.Context()
+    self._model_requestor = self._zmq_context.socket(zmq.REQ)
+    self._model_requestor.connect("tcp://%s:%s" % (learner_ip, ports[2]))
 
-    agent.reset()
-    obs = env.reset()
-    if eval_env is not None:
-      eval_obs = eval_env.reset()
-    done = False
-    episode_reward = 0.
-    episode_step = 0
-    episodes = 0
-    t = 0
+  def run(self):
+    with U.single_threaded_session() as sess:
+      self._agent.initialize(sess)
+      sess.graph.finalize()
+      self._update_model()
 
-    epoch = 0
-    start_time = time.time()
+      self._agent.reset()
+      obs = self._env.reset()
+      perturbed_distance = self._adapt_param_noise()
 
-    epoch_episode_rewards = []
-    epoch_episode_steps = []
-    epoch_episode_eval_rewards = []
-    epoch_episode_eval_steps = []
-    epoch_start_time = time.time()
-    epoch_actions = []
-    epoch_qs = []
-    epoch_episodes = 0
-    for epoch in range(nb_epochs):
-      for cycle in range(nb_epoch_cycles):
-        # Perform rollouts.
-        for t_rollout in range(nb_rollout_steps):
-          # Predict next action.
-          action, q = agent.pi(obs, apply_noise=True, compute_Q=True)
-          assert action.shape == env.action_space.shape
+      cum_return, steps, episodes = 0.0, 0, 0
+      start_time = time.time()
+      while True:
+        action, q = self._agent.pi(obs, apply_noise=True, compute_Q=True)
+        assert action.shape == self._env.action_space.shape
+        assert action.shape == self._max_action.shape
+        new_obs, reward, done, info = self._env.step(self._max_action * action)
+        transition = (obs, action, reward, new_obs, done)
+        self._replay_memory.push(*transition)
+        cum_return += reward
+        steps += 1
+        obs = new_obs
+        if done:
+          episodes += 1
+          self._agent.reset()
+          self._update_model()
+          obs = self._env.reset()
+          perturbed_distance = self._adapt_param_noise()
+          print("Episode %d done. Return: %f. Steps: %f. "
+              "Perturbed Distance: %f. Time: %f." % (episodes, cum_return,
+              steps, perturbed_distance, time.time() - start_time))
+          cum_return, steps = 0.0, 0
+          start_time = time.time()
 
-          # Execute next action.
-          if rank == 0 and render:
-            env.render()
-          assert max_action.shape == action.shape
-          # scale for execution in env
-          # (as far as DDPG is concerned, every action is in [-1, 1])
-          new_obs, r, done, info = env.step(max_action * action)
-          t += 1
-          if rank == 0 and render:
-            env.render()
-          episode_reward += r
-          episode_step += 1
+  def _adapt_param_noise(self):
+    if self._replay_memory.total >= self._batch_size:
+      batch = self._transitions_to_batch(
+          self._replay_memory.sample(self._batch_size))
+      return self._agent.adapt_param_noise(batch)
 
-          # Book-keeping.
-          epoch_actions.append(action)
-          epoch_qs.append(q)
-          agent.store_transition(obs, action, r, new_obs, done)
-          obs = new_obs
+  def _transitions_to_batch(self, transitions):
+    batch = Transition(*zip(*transitions))
+    observation = np.stack(batch.observation)
+    next_observation = np.stack(batch.next_observation)
+    action = np.stack(batch.action)
+    reward = np.expand_dims(np.array(batch.reward, dtype=np.float32), axis=1)
+    done = np.expand_dims(np.array(batch.done, dtype=np.float32), axis=1)
+    return {
+        'obs0': observation,
+        'obs1': next_observation,
+        'rewards': reward,
+        'actions': action,
+        'terminals1': done
+    }
 
-          if done:
-            # Episode done.
-            epoch_episode_rewards.append(episode_reward)
-            episode_rewards_history.append(episode_reward)
-            epoch_episode_steps.append(episode_step)
-            episode_reward = 0.
-            episode_step = 0
-            epoch_episodes += 1
-            episodes += 1
+  def _update_model(self):
+      self._model_requestor.send_string("request model")
+      self._agent.load_params(self._model_requestor.recv_pyobj())
 
-            agent.reset()
-            obs = env.reset()
 
-        # Train.
-        epoch_actor_losses = []
-        epoch_critic_losses = []
-        epoch_adaptive_distances = []
-        for t_train in range(nb_train_steps):
-          # Adapt param noise, if necessary.
-          if (memory.nb_entries >= batch_size and
-              t_train % param_noise_adaption_interval == 0):
-            distance = agent.adapt_param_noise()
-            epoch_adaptive_distances.append(distance)
+class DDPGLearner(object):
 
-          cl, al = agent.train()
-          epoch_critic_losses.append(cl)
-          epoch_actor_losses.append(al)
-          agent.update_target_net()
+  def __init__(self, env, actor, critic, batch_size, memory_size,
+               memory_warmup_size, gamma, tau, normalize_returns,
+               normalize_observations, action_noise, param_noise, critic_l2_reg,
+               actor_lr, critic_lr, popart, clip_norm, reward_scale,
+               print_interval, ports=("6700", "6701", "6702")):
+    self._batch_size = batch_size
+    self._print_interval = print_interval
+    self._ports = ports
+    self._agent = DDPG(actor,
+                       critic,
+                       env.observation_space.shape,
+                       env.action_space.shape,
+                       gamma=gamma,
+                       tau=tau,
+                       normalize_returns=normalize_returns,
+                       normalize_observations=normalize_observations,
+                       action_noise=action_noise,
+                       param_noise=param_noise,
+                       critic_l2_reg=critic_l2_reg,
+                       actor_lr=actor_lr,
+                       critic_lr=critic_lr,
+                       enable_popart=popart,
+                       clip_norm=clip_norm,
+                       reward_scale=reward_scale)
+    self._replay_memory = RemoteReplayMemory(
+        is_server=True,
+        memory_size=memory_size,
+        memory_warmup_size=memory_warmup_size,
+        ports=ports[:2])
 
-        # Evaluate.
-        eval_episode_rewards = []
-        eval_qs = []
-        if eval_env is not None:
-          eval_episode_reward = 0.
-          for t_rollout in range(nb_eval_steps):
-            eval_action, eval_q = agent.pi(
-                eval_obs, apply_noise=False, compute_Q=True)
-            # scale for execution in env
-            # (as far as DDPG is concerned, every action is in [-1, 1])
-            eval_obs, eval_r, eval_done, eval_info = eval_env.step(
-                max_action * eval_action)
-            if render_eval:
-              eval_env.render()
-            eval_episode_reward += eval_r
+  def run(self):
+    batch_queue = queue.Queue(8)
+    batch_thread = Thread(target=self._prepare_batch,
+                          args=(batch_queue, self._batch_size,))
+    batch_thread.start()
 
-            eval_qs.append(eval_q)
-            if eval_done:
-              eval_obs = eval_env.reset()
-              eval_episode_rewards.append(eval_episode_reward)
-              eval_episode_rewards_history.append(eval_episode_reward)
-              eval_episode_reward = 0.
+    updates, rollout_frames, critic_loss, actor_loss = 0, 0, [], []
+    time_start = time.time()
+    with U.single_threaded_session() as sess:
+      self._agent.initialize(sess)
+      sess.graph.finalize()
+      self._agent.reset()
+      self._model_params = self._agent.read_params()
+      self._reply_model_thread = Thread(target=self._reply_model,
+                                        args=(self._ports[2],))
+      self._reply_model_thread.start()
+      while True:
+        updates += 1
+        batch = batch_queue.get()
+        cl, al = self._agent.train(batch)
+        critic_loss.append(cl), actor_loss.append(al)
+        self._model_params = self._agent.read_params()
 
-      mpi_size = MPI.COMM_WORLD.Get_size()
-      # Log stats.
-      # XXX shouldn't call np.mean on variable length lists
-      duration = time.time() - start_time
-      stats = agent.get_stats()
-      combined_stats = stats.copy()
-      combined_stats['rollout/return'] = np.mean(epoch_episode_rewards)
-      combined_stats['rollout/return_history'] = np.mean(episode_rewards_history)
-      combined_stats['rollout/episode_steps'] = np.mean(epoch_episode_steps)
-      combined_stats['rollout/actions_mean'] = np.mean(epoch_actions)
-      combined_stats['rollout/Q_mean'] = np.mean(epoch_qs)
-      combined_stats['train/loss_actor'] = np.mean(epoch_actor_losses)
-      combined_stats['train/loss_critic'] = np.mean(epoch_critic_losses)
-      combined_stats['train/param_noise_distance'] = np.mean(
-          epoch_adaptive_distances)
-      combined_stats['total/duration'] = duration
-      combined_stats['total/steps_per_second'] = float(t) / float(duration)
-      combined_stats['total/episodes'] = episodes
-      combined_stats['rollout/episodes'] = epoch_episodes
-      combined_stats['rollout/actions_std'] = np.std(epoch_actions)
-      # Evaluation statistics.
-      if eval_env is not None:
-        combined_stats['eval/return'] = eval_episode_rewards
-        combined_stats['eval/return_history'] = np.mean(
-            eval_episode_rewards_history)
-        combined_stats['eval/Q'] = eval_qs
-        combined_stats['eval/episodes'] = len(eval_episode_rewards)
-      def as_scalar(x):
-        if isinstance(x, np.ndarray):
-          assert x.size == 1
-          return x[0]
-        elif np.isscalar(x):
-          return x
-        else:
-          raise ValueError('expected scalar, got %s'%x)
-      combined_stats_sums = MPI.COMM_WORLD.allreduce(
-          np.array([as_scalar(x) for x in combined_stats.values()]))
-      combined_stats = {k : v / mpi_size
-                        for (k,v) in zip(combined_stats.keys(),
-                                         combined_stats_sums)}
+        if updates % self._print_interval == 0:
+          time_elapsed = time.time() - time_start
+          train_fps = self._print_interval * self._batch_size / time_elapsed
+          rollout_fps = (self._replay_memory.total - rollout_frames) / time_elapsed
+          print("Update: %d	Train-fps: %.1f	Rollout-fps: %.1f	"
+              "Critic Loss: %.5f	Actor Loss: %.5f	Time: %.1f" % (updates,
+              train_fps, rollout_fps, np.mean(critic_loss), np.mean(actor_loss),
+              time_elapsed))
+          time_start, critic_loss, actor_loss = time.time(), [], []
+          rollout_frames = self._replay_memory.total
 
-      # Total statistics.
-      combined_stats['total/epochs'] = epoch + 1
-      combined_stats['total/steps'] = t
+        self._agent.update_target_net()
 
-      for key in sorted(combined_stats.keys()):
-        logger.record_tabular(key, combined_stats[key])
-      logger.dump_tabular()
-      logger.info('')
-      logdir = logger.get_dir()
-      if rank == 0 and logdir:
-        if hasattr(env, 'get_state'):
-          with open(os.path.join(logdir, 'env_state.pkl'), 'wb') as f:
-            pickle.dump(env.get_state(), f)
-        if eval_env and hasattr(eval_env, 'get_state'):
-          with open(os.path.join(logdir, 'eval_env_state.pkl'), 'wb') as f:
-            pickle.dump(eval_env.get_state(), f)
+  def _prepare_batch(self, batch_queue, batch_size):
+    while True:
+      transitions = self._replay_memory.sample(batch_size)
+      batch = self._transitions_to_batch(transitions)
+      batch_queue.put(batch)
+
+  def _transitions_to_batch(self, transitions):
+    batch = Transition(*zip(*transitions))
+    observation = np.stack(batch.observation)
+    next_observation = np.stack(batch.next_observation)
+    action = np.stack(batch.action)
+    reward = np.expand_dims(np.array(batch.reward, dtype=np.float32), axis=1)
+    done = np.expand_dims(np.array(batch.done, dtype=np.float32), axis=1)
+    return {
+        'obs0': observation,
+        'obs1': next_observation,
+        'rewards': reward,
+        'actions': action,
+        'terminals1': done
+    }
+
+  def _reply_model(self, port):
+    zmq_context = zmq.Context()
+    receiver = zmq_context.socket(zmq.REP)
+    receiver.bind("tcp://*:%s" % port)
+    while True:
+      msg = receiver.recv_string()
+      assert msg == "request model"
+      receiver.send_pyobj(self._model_params)
+      print("send")

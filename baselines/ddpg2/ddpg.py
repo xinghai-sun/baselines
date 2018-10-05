@@ -70,10 +70,10 @@ def get_perturbed_actor_updates(actor, perturbed_actor, param_noise_stddev):
 
 
 class DDPG(object):
-  def __init__(self, actor, critic, memory, observation_shape, action_shape,
+  def __init__(self, actor, critic, observation_shape, action_shape,
                param_noise=None, action_noise=None, gamma=0.99, tau=0.001,
                normalize_returns=False, enable_popart=False,
-               normalize_observations=True, batch_size=128,
+               normalize_observations=True,
                observation_range=(-5., 5.), action_range=(-1., 1.),
                return_range=(-np.inf, np.inf), adaptive_param_noise=True,
                adaptive_param_noise_policy_threshold=.1, critic_l2_reg=0.,
@@ -96,7 +96,7 @@ class DDPG(object):
     # Parameters.
     self.gamma = gamma
     self.tau = tau
-    self.memory = memory
+    self.memory = None
     self.normalize_observations = normalize_observations
     self.normalize_returns = normalize_returns
     self.action_noise = action_noise
@@ -111,7 +111,6 @@ class DDPG(object):
     self.clip_norm = clip_norm
     self.enable_popart = enable_popart
     self.reward_scale = reward_scale
-    self.batch_size = batch_size
     self.stats_sample = None
     self.critic_l2_reg = critic_l2_reg
 
@@ -319,15 +318,15 @@ class DDPG(object):
     action = np.clip(action, self.action_range[0], self.action_range[1])
     return action, q
 
-  def store_transition(self, obs0, action, reward, obs1, terminal1):
-    reward *= self.reward_scale
-    self.memory.append(obs0, action, reward, obs1, terminal1)
-    if self.normalize_observations:
-      self.obs_rms.update(np.array([obs0]))
+  #def store_transition(self, obs0, action, reward, obs1, terminal1):
+    #reward *= self.reward_scale
+    #self.memory.append(obs0, action, reward, obs1, terminal1)
+    #if self.normalize_observations:
+      #self.obs_rms.update(np.array([obs0]))
 
-  def train(self):
+  def train(self, batch):
     # Get a batch.
-    batch = self.memory.sample(batch_size=self.batch_size)
+    #batch = self.memory.sample(batch_size=self.batch_size)
 
     if self.normalize_returns and self.enable_popart:
       old_mean, old_std, target_Q = self.sess.run(
@@ -375,6 +374,20 @@ class DDPG(object):
     self.actor_optimizer.sync()
     self.critic_optimizer.sync()
     self.sess.run(self.target_init_updates)
+    self.param_placeholders = [
+        tf.placeholder(p.dtype, shape=p.get_shape())
+        for p in self.critic.trainable_vars + self.actor.trainable_vars]
+    self.param_assign_ops = [p.assign(new_p) for p, new_p in zip(
+        self.critic.trainable_vars + self.actor.trainable_vars,
+        self.param_placeholders)]
+
+  def read_params(self):
+    return self.sess.run(self.critic.trainable_vars + self.actor.trainable_vars)
+
+  def load_params(self, loaded_params):
+    self.sess.run(self.param_assign_ops,
+                  feed_dict={p : v for p, v in zip(self.param_placeholders,
+                                                   loaded_params)})
 
   def update_target_net(self):
     self.sess.run(self.target_soft_updates)
@@ -399,13 +412,13 @@ class DDPG(object):
 
     return stats
 
-  def adapt_param_noise(self):
+  def adapt_param_noise(self, batch):
     if self.param_noise is None:
       return 0.
 
     # Perturb a separate copy of the policy to adjust the scale
     # for the next "real" perturbation.
-    batch = self.memory.sample(batch_size=self.batch_size)
+    #batch = self.memory.sample(batch_size=self.batch_size)
     self.sess.run(self.perturb_adaptive_policy_ops, feed_dict={
       self.param_noise_stddev: self.param_noise.current_stddev,
     })
@@ -413,7 +426,6 @@ class DDPG(object):
       self.obs0: batch['obs0'],
       self.param_noise_stddev: self.param_noise.current_stddev,
     })
-
     mean_distance = MPI.COMM_WORLD.allreduce(distance, op=MPI.SUM) \
         / MPI.COMM_WORLD.Get_size()
     self.param_noise.adapt(mean_distance)
