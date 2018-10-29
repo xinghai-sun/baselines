@@ -100,6 +100,8 @@ class DDPGActor(object):
       batch = self._transitions_to_batch(
           self._replay_memory.sample(self._batch_size))
       return self._agent.adapt_param_noise(batch)
+    else:
+      return 0
 
   def _transitions_to_batch(self, transitions):
     batch = Transition(*zip(*transitions))
@@ -218,4 +220,3 @@ class DDPGLearner(object):
       msg = receiver.recv_string()
       assert msg == "request model"
       receiver.send_pyobj(self._model_params)
-      print("send")
